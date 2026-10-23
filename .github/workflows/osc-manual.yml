@@ -1,0 +1,213 @@
+# Fork-only exact-ref validation. This file is intentionally not sent upstream.
+name: OSC fork CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Git branch, tag, or 40-character commit SHA to validate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: osc-manual-${{ inputs.target_ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout candidate ref
+        uses: actions/checkout@v7
+        with:
+          repository: Nitjsefnie-OSC/Filee
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Report checked-out SHA (provenance echo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [[ ! "$checked_out_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git rev-parse HEAD did not produce a 40-character commit SHA: $checked_out_sha"
+            exit 1
+          fi
+          printf 'checked-out SHA: %s\n' "$checked_out_sha"
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore Filee.slnx
+
+      - name: Check formatting
+        run: dotnet format Filee.slnx --verify-no-changes --no-restore --severity warn
+
+      # The release embeds the Noto fonts, so the tests run with them here too: the headless UI tests load them.
+      - name: Fonts
+        shell: pwsh
+        run: ./build/fetch-fonts.ps1
+
+      - name: Build
+        run: dotnet build Filee.slnx --no-restore -c Release
+
+      # Windows 11 Explorer menu (native DLL + unsigned sparse package); its tests load the DLL in-process.
+      # The toolchain (~100 MB) is saved right after it is downloaded, even if a later step fails, so it is
+      # downloaded once and not on every run. Release builds restore the same cache.
+      - name: Restore Zig toolchain
+        id: zig
+        uses: actions/cache/restore@v5
+        with:
+          path: build/.cache/zig-x86_64-windows-0.16.0
+          key: zig-0.16.0-x86_64-windows
+
+      - name: Build Explorer menu extension
+        shell: pwsh
+        run: ./build/build-explorer-menu.ps1
+
+      - name: Save Zig toolchain
+        if: steps.zig.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: build/.cache/zig-x86_64-windows-0.16.0
+          key: zig-0.16.0-x86_64-windows
+
+      # rhwp, Pandoc and 7-Zip are small; with them the HWP/HWPX and archive engine tests run too (LibreOffice is
+      # skipped to save time).
+      - name: Fetch rhwp, Pandoc and 7-Zip for engine tests
+        shell: pwsh
+        run: ./build/fetch-engines.ps1 -Only rhwp,pandoc,7zip
+
+      # The UI tests on their own first, as the release runs them (there they crashed with 0xC0000005): a crash
+      # names the test that was running and leaves a dump in TestResults.
+      - name: Test UI on its own
+        run: dotnet test tests/Filee.App.Tests --no-build -c Release --blame-crash --blame-hang-timeout 5m --logger "console;verbosity=normal" --results-directory TestResults/app
+
+      - name: Test
+        run: dotnet test Filee.slnx --no-build -c Release --filter "FullyQualifiedName!~Filee.App.Tests" --logger "trx" --results-directory TestResults
+
+      # Builds Setup (src/Filee.Setup) around a stub app and runs it in a sandbox: install, update and uninstall into a
+      # scratch folder with a registry file of its own, without administrator rights.
+      - name: Check the installer
+        shell: pwsh
+        run: ./build/build-installer.ps1 -CheckOnly
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-windows
+          path: TestResults/
+          if-no-files-found: ignore
+
+      - name: Upload UI screenshots
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-screenshots
+          path: |
+            tests/Filee.App.Tests/bin/Release/net10.0/screenshots/
+            tests/Filee.Setup.Tests/bin/Release/net10.0/screenshots/
+          if-no-files-found: ignore
+
+  # Mirrors upstream portable.yml's portable job on the candidate ref: build and test
+  # on every platform the upstream PR gate covers. Packaging-only legs (linux-native rhwp
+  # build, package build, package smoke, glibc check, app launch, artifact uploads) are
+  # SKIPPED loudly below: they gate the release pipeline, not candidate code, and run
+  # upstream on the pull request.
+  portable-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rid: linux-x64
+          - runner: ubuntu-24.04-arm
+            rid: linux-arm64
+          - runner: macos-15
+            rid: osx-arm64
+          - runner: macos-15-intel
+            rid: osx-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout candidate ref
+        uses: actions/checkout@v7
+        with:
+          repository: Nitjsefnie-OSC/Filee
+          ref: ${{ inputs.target_ref }}
+          persist-credentials: false
+      - name: Report checked-out SHA (provenance echo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [[ ! "$checked_out_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::git rev-parse HEAD did not produce a 40-character commit SHA: $checked_out_sha"
+            exit 1
+          fi
+          printf 'checked-out SHA: %s\n' "$checked_out_sha"
+      - name: SKIPPED packaging legs (loud)
+        shell: bash
+        run: |
+          echo "osc-manual skips packaging-only legs on this ref: linux-native rhwp, package build, package smoke, glibc check, app launch, artifact uploads."
+          echo "They gate the release pipeline, not candidate code, and run upstream on the pull request."
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates libc6 libgcc-s1 libgssapi-krb5-2 libicu74 libssl3t64 libstdc++6 tzdata zlib1g \
+            libfontconfig1 libfreetype6 libx11-6 libice6 libsm6 libxrandr2 libxkbcommon0 libxi6 libxtst6 libxt6 xvfb fonts-noto-cjk
+
+      - name: Fonts
+        run: ./build/fetch-fonts.ps1
+
+      - name: Restore engine downloads
+        uses: actions/cache@v5
+        with:
+          path: build/.cache/portable-downloads
+          key: portable-engines-${{ matrix.rid }}-${{ hashFiles('src/Filee.Engines/Infrastructure/engines.json') }}
+
+      - name: Build and test native projects
+        run: |
+          ./build/fetch-portable-engines.ps1 -Runtime '${{ matrix.rid }}' -Destination engines
+          dotnet build Filee.slnx -c Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $projects = @('Filee.Core.Tests', 'Filee.Platform.Tests', 'Filee.Engines.Tests', 'Filee.Cli.Tests', 'Filee.App.Tests')
+          foreach ($project in $projects) {
+            $testArguments = @('test', "tests/$project/$project.csproj", '--no-build', '-c', 'Release', '--logger', 'trx', '--results-directory', "TestResults/${{ matrix.rid }}",
+              '--filter', 'FullyQualifiedName!=Filee.App.Tests.ExplorerMenuTests.Every_native_import_exists_in_the_dll_it_names&FullyQualifiedName!=Filee.App.Tests.ExplorerMenuTests.Reading_the_registered_package_never_throws')
+            if ($IsLinux) {
+              xvfb-run -a env -u WAYLAND_DISPLAY XDG_SESSION_TYPE=x11 dotnet @testArguments
+            } else {
+              dotnet @testArguments
+            }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unix-test-results-${{ matrix.rid }}
+          path: |
+            TestResults/${{ matrix.rid }}/
+            tests/Filee.App.Tests/bin/Release/net10.0/screenshots/
+            ${{ runner.temp }}/filee-startup.log
+            ${{ runner.temp }}/filee-screens/
+          if-no-files-found: ignore
+
